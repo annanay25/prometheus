@@ -914,7 +914,7 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	groups, errs := m.LoadGroups(interval, externalLabels, files...)
+	groups, errs := m.opts.GroupLoader.Load(m.opts, m.done, interval, externalLabels, m.restored, m.logger, files...)
 	if errs != nil {
 		for _, e := range errs {
 			level.Error(m.logger).Log("msg", "loading groups failed", "err", e)
@@ -981,7 +981,14 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 
 // GroupLoader is responsible for loading rule groups from arbitrary sources and parsing them.
 type GroupLoader interface {
-	Load(identifier string) (*rulefmt.RuleGroups, []error)
+	Load(opts *ManagerOptions,
+		done chan struct{},
+		defaultInterval time.Duration,
+		externalLabels labels.Labels,
+		restored bool,
+		logger log.Logger,
+		filenames ...string,
+	) (map[string]*Group, []error)
 	Parse(query string) (parser.Expr, error)
 }
 
@@ -989,35 +996,35 @@ type GroupLoader interface {
 // and parser.ParseExpr
 type FileLoader struct{}
 
-func (FileLoader) Load(identifier string) (*rulefmt.RuleGroups, []error) {
-	return rulefmt.ParseFile(identifier)
-}
-
-func (FileLoader) Parse(query string) (parser.Expr, error) { return parser.ParseExpr(query) }
-
-// LoadGroups reads groups from a list of files.
-func (m *Manager) LoadGroups(
-	interval time.Duration, externalLabels labels.Labels, filenames ...string,
+// Load implements GroupLoader
+func (FileLoader) Load(
+	opts *ManagerOptions,
+	done chan struct{},
+	defaultInterval time.Duration,
+	externalLabels labels.Labels,
+	restored bool,
+	logger log.Logger,
+	filenames ...string,
 ) (map[string]*Group, []error) {
 	groups := make(map[string]*Group)
 
-	shouldRestore := !m.restored
+	shouldRestore := !restored
 
 	for _, fn := range filenames {
-		rgs, errs := m.opts.GroupLoader.Load(fn)
+		rgs, errs := rulefmt.ParseFile(fn)
 		if errs != nil {
 			return nil, errs
 		}
 
 		for _, rg := range rgs.Groups {
-			itv := interval
+			itv := defaultInterval
 			if rg.Interval != 0 {
 				itv = time.Duration(rg.Interval)
 			}
 
 			rules := make([]Rule, 0, len(rg.Rules))
 			for _, r := range rg.Rules {
-				expr, err := m.opts.GroupLoader.Parse(r.Expr.Value)
+				expr, err := opts.GroupLoader.Parse(r.Expr.Value)
 				if err != nil {
 					return nil, []error{errors.Wrap(err, fn)}
 				}
@@ -1030,8 +1037,8 @@ func (m *Manager) LoadGroups(
 						labels.FromMap(r.Labels),
 						labels.FromMap(r.Annotations),
 						externalLabels,
-						m.restored,
-						log.With(m.logger, "alert", r.Alert),
+						restored,
+						log.With(logger, "alert", r.Alert),
 					))
 					continue
 				}
@@ -1048,14 +1055,17 @@ func (m *Manager) LoadGroups(
 				Interval:      itv,
 				Rules:         rules,
 				ShouldRestore: shouldRestore,
-				Opts:          m.opts,
-				done:          m.done,
+				Opts:          opts,
+				done:          done,
 			})
 		}
 	}
 
 	return groups, nil
 }
+
+// Parse implements GroupLoader
+func (FileLoader) Parse(query string) (parser.Expr, error) { return parser.ParseExpr(query) }
 
 // Group names need not be unique across filenames.
 func groupKey(file, name string) string {
